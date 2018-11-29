@@ -446,7 +446,7 @@ func startKeyForCondition(c query.Condition, height int64) []byte {
 func startKey(fields ...interface{}) []byte {
 	var b bytes.Buffer
 	for _, f := range fields {
-		b.Write([]byte(fmt.Sprintf("%v", f) + tagKeySeparator))
+		b.Write([]byte(fmt.Sprintf("%v%v", f, tagKeySeparator)))
 	}
 	return b.Bytes()
 }
