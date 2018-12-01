@@ -307,7 +307,12 @@ func (pool *BlockPool) removePeer(peerID p2p.ID) {
 			requester.redo(peerID)
 		}
 	}
-	delete(pool.peers, peerID)
+	if peer := pool.peers[peerID]; peer != nil {
+		if peer.timeout != nil {
+			peer.timeout.Stop()
+		}
+		delete(pool.peers, peerID)
+	}
 }
 
 // Pick an available peer with at least the given minHeight.
