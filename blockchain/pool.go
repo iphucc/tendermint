@@ -99,7 +99,15 @@ func (pool *BlockPool) OnStart() error {
 	return nil
 }
 
-func (pool *BlockPool) OnStop() {}
+func (pool *BlockPool) OnStop() {
+	pool.mtx.Lock()
+	for _, r := range pool.requesters {
+		r.Stop()
+	}
+	pool.requesters = make(map[int64]*bpRequester)
+	//pool.peers = make(map[p2p.ID]*bpPeer)
+	pool.mtx.Unlock()
+}
 
 // Run spawns requesters as needed.
 func (pool *BlockPool) makeRequestersRoutine() {
@@ -541,6 +549,9 @@ func (bpr *bpRequester) redo(peerId p2p.ID) {
 // Responsible for making more requests as necessary
 // Returns only when a block is found (e.g. AddBlock() is called)
 func (bpr *bpRequester) requestRoutine() {
+	defer func() {
+		bpr.pool = nil
+	}()
 OUTER_LOOP:
 	for {
 		// Pick a peer to send request to.
@@ -567,9 +578,6 @@ OUTER_LOOP:
 	WAIT_LOOP:
 		for {
 			select {
-			case <-bpr.pool.Quit():
-				bpr.Stop()
-				return
 			case <-bpr.Quit():
 				return
 			case peerID := <-bpr.redoCh:
