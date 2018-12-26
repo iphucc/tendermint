@@ -331,6 +331,20 @@ func (cs *ConsensusState) OnStop() {
 	// WAL is stopped in receiveRoutine.
 }
 
+// OnReset implements cmn.Service.
+func (cs *ConsensusState) OnReset() error {
+	cs.Logger.Info("Reset consensus.State")
+	cs.done = make(chan struct{})
+	cs.wal = nilWAL{}
+	err := cs.evsw.Reset()
+	if err != nil {
+		cs.Logger.Error("Error Reset evsw", "err", err)
+		return err
+	}
+	err = cs.timeoutTicker.Reset()
+	return err
+}
+
 // Wait waits for the the main routine to return.
 // NOTE: be sure to Stop() the event switch and drain
 // any event channels or this may deadlock

@@ -109,6 +109,14 @@ func (pool *BlockPool) OnStop() {
 	pool.mtx.Unlock()
 }
 
+// OnReset implements cmn.Service.
+func (pool *BlockPool) OnReset() error {
+	pool.Logger.Info("Reset BlockPool")
+	pool.peers = make(map[p2p.ID]*bpPeer)
+	pool.numPending = 0
+	return nil
+}
+
 // Run spawns requesters as needed.
 func (pool *BlockPool) makeRequestersRoutine() {
 	for {

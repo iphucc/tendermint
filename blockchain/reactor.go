@@ -4,6 +4,7 @@ import (
 	"errors"
 	"fmt"
 	"reflect"
+	"sync/atomic"
 	"time"
 
 	amino "github.com/tendermint/go-amino"
@@ -36,12 +37,17 @@ const (
 	maxMsgSize                         = types.MaxBlockSizeBytes +
 		bcBlockResponseMessagePrefixSize +
 		bcBlockResponseMessageFieldKeySize
+
+	maxLaggingBlocks = 4
 )
 
 type consensusReactor interface {
 	// for when we switch from blockchain reactor and fast sync to
 	// the consensus machine
 	SwitchToConsensus(sm.State, int)
+	// for when we switch from consensus reactor and consensus machine to
+	// the fast sync
+	BackToFastSync(leadingPeer p2p.Peer, blocksLagged int)
 }
 
 type peerError struct {
@@ -64,6 +70,10 @@ type BlockchainReactor struct {
 	store     *BlockStore
 	pool      *BlockPool
 	fastSync  bool
+
+	inFastSync   uint32
+	blocksLagged int
+	leadingPeer  p2p.Peer
 
 	requestsCh <-chan BlockRequest
 	errorsCh   <-chan peerError
@@ -95,6 +105,8 @@ func NewBlockchainReactor(state sm.State, blockExec *sm.BlockExecutor, store *Bl
 		store:        store,
 		pool:         pool,
 		fastSync:     fastSync,
+		inFastSync:   0,
+		blocksLagged: 0,
 		requestsCh:   requestsCh,
 		errorsCh:     errorsCh,
 	}
@@ -115,14 +127,41 @@ func (bcR *BlockchainReactor) OnStart() error {
 		if err != nil {
 			return err
 		}
+		bcR.inFastSync = 1
 		go bcR.poolRoutine()
 	}
+	go bcR.statusUpdateRoutine()
 	return nil
 }
 
 // OnStop implements cmn.Service.
 func (bcR *BlockchainReactor) OnStop() {
 	bcR.pool.Stop()
+}
+
+// BackToFastSync switches from consensus mode to fast_sync mode.
+// Similar to imitating OnReset and OnStart
+func (bcR *BlockchainReactor) BackToFastSync(state sm.State) error {
+	bcR.Logger.Info("BackToFastSync", "store.Height", bcR.store.Height(), "state.Height", state.LastBlockHeight)
+	bcR.initialState = state
+	bcR.pool.height = state.LastBlockHeight + 1
+	if bcR.fastSync {
+		err := bcR.pool.Reset()
+		if err != nil {
+			bcR.Logger.Error("Reset BlockPool failed")
+			return err
+		}
+	} else {
+		bcR.Logger.Info("Set fastSync flag")
+		bcR.fastSync = true
+	}
+	err := bcR.pool.Start()
+	if err != nil {
+		bcR.Logger.Error("Start BlockPool failed")
+		return err
+	}
+	go bcR.poolRoutine()
+	return nil
 }
 
 // GetChannels implements Reactor
@@ -206,8 +245,38 @@ func (bcR *BlockchainReactor) Receive(chID byte, src p2p.Peer, msgBytes []byte) 
 	case *bcStatusResponseMessage:
 		// Got a peer status. Unverified.
 		bcR.pool.SetPeerHeight(src.ID(), msg.Height)
+		blocksLagged := msg.Height - bcR.store.Height()
+		if blocksLagged > maxLaggingBlocks && atomic.CompareAndSwapUint32(&bcR.inFastSync, 0, 1) {
+			bcR.Logger.Info("Receive", "leadingPeer", src, "Height", msg.Height, "blocksLagged", blocksLagged)
+			bcR.leadingPeer = src
+			bcR.blocksLagged = int(blocksLagged)
+			conR := bcR.Switch.Reactor("CONSENSUS").(consensusReactor)
+			conR.BackToFastSync(src, bcR.blocksLagged)
+		}
 	default:
 		bcR.Logger.Error(fmt.Sprintf("Unknown message type %v", reflect.TypeOf(msg)))
+	}
+}
+
+func (bcR *BlockchainReactor) statusUpdateRoutine() {
+	statusUpdateTicker := time.NewTicker(statusUpdateIntervalSeconds * time.Second)
+	statusUpdateTicker2 := time.NewTicker(59 * time.Second)
+
+	for {
+		select {
+		case <-statusUpdateTicker.C:
+			// ask for status updates in fast_sync mode
+			if bcR.inFastSync == 1 {
+				go bcR.BroadcastStatusRequest() // nolint: errcheck
+			}
+		case <-statusUpdateTicker2.C:
+			// ask for status updates in consensus mode
+			if bcR.inFastSync != 1 {
+				go bcR.BroadcastStatusRequest() // nolint: errcheck
+			}
+		case <-bcR.Quit():
+			return
+		}
 	}
 }
 
@@ -216,7 +285,6 @@ func (bcR *BlockchainReactor) Receive(chID byte, src p2p.Peer, msgBytes []byte) 
 func (bcR *BlockchainReactor) poolRoutine() {
 
 	trySyncTicker := time.NewTicker(trySyncIntervalMS * time.Millisecond)
-	statusUpdateTicker := time.NewTicker(statusUpdateIntervalSeconds * time.Second)
 	switchToConsensusTicker := time.NewTicker(switchToConsensusIntervalSeconds * time.Second)
 
 	blocksSynced := 0
@@ -251,10 +319,6 @@ FOR_LOOP:
 				bcR.Switch.StopPeerForError(peer, err)
 			}
 
-		case <-statusUpdateTicker.C:
-			// ask for status updates
-			go bcR.BroadcastStatusRequest() // nolint: errcheck
-
 		case <-switchToConsensusTicker.C:
 			height, numPending, lenRequesters := bcR.pool.GetStatus()
 			outbound, inbound, _ := bcR.Switch.NumPeers()
@@ -267,6 +331,12 @@ FOR_LOOP:
 				conR, ok := bcR.Switch.Reactor("CONSENSUS").(consensusReactor)
 				if ok {
 					conR.SwitchToConsensus(state, blocksSynced)
+					bcR.inFastSync = 0
+					if blocksSynced < bcR.blocksLagged {
+						bcR.blocksLagged = 0
+						// TODO: punish peer
+						// bcR.Switch.StopPeerForError(bcR.leadingPeer, errors.New("peer deceived with a wrong height"))
+					}
 				} else {
 					// should only happen during testing
 				}

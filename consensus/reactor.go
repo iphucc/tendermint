@@ -100,15 +100,22 @@ func (conR *ConsensusReactor) OnStop() {
 // It resets the state, turns off fast_sync, and starts the consensus state-machine
 func (conR *ConsensusReactor) SwitchToConsensus(state sm.State, blocksSynced int) {
 	conR.Logger.Info("SwitchToConsensus")
+
+	conR.mtx.Lock()
+	if !conR.fastSync {
+		conR.mtx.Unlock()
+		conR.Logger.Error("Already in consensus mode")
+		return
+	}
+	conR.fastSync = false
+	conR.mtx.Unlock()
+	conR.metrics.FastSyncing.Set(0)
+
+	conR.conS.CommitRound = -1
 	conR.conS.reconstructLastCommit(state)
 	// NOTE: The line below causes broadcastNewRoundStepRoutine() to
 	// broadcast a NewRoundStepMessage.
 	conR.conS.updateToState(state)
-
-	conR.mtx.Lock()
-	conR.fastSync = false
-	conR.mtx.Unlock()
-	conR.metrics.FastSyncing.Set(0)
 
 	if blocksSynced > 0 {
 		// dont bother with the WAL if we fast synced
@@ -118,6 +125,45 @@ func (conR *ConsensusReactor) SwitchToConsensus(state sm.State, blocksSynced int
 	if err != nil {
 		conR.Logger.Error("Error starting conS", "err", err)
 		return
+	}
+}
+
+type blockchainReactor interface {
+	// for when we switch from consensus mode to fast_sync mode.
+	BackToFastSync(state sm.State) error
+}
+
+// BackToFastSync switches from consensus mode to fast_sync mode.
+// It turns off consensus state-machine, and starts the fast_sync
+func (conR *ConsensusReactor) BackToFastSync(leadingPeer p2p.Peer, blocksLagged int) {
+	conR.Logger.Info("BackToFastSync", "leadingPeer", leadingPeer, "blocksLagged", blocksLagged)
+
+	conR.mtx.Lock()
+	if conR.fastSync {
+		conR.mtx.Unlock()
+		conR.Logger.Error("Already in fast_sync mode")
+		return
+	}
+	conR.fastSync = true
+	conR.mtx.Unlock()
+
+	err := conR.conS.Stop()
+	if err != nil {
+		conR.Logger.Error("Error stopping conS", "err", err)
+	}
+
+	conR.conS.Wait()
+
+	err = conR.conS.Reset()
+	if err != nil {
+		conR.Logger.Error("Error resetting conS", "err", err)
+	}
+
+	state := conR.conS.GetState()
+	bcR := conR.Switch.Reactor("BLOCKCHAIN").(blockchainReactor)
+	err = bcR.BackToFastSync(state)
+	if err != nil {
+		conR.Logger.Error("BackToFastSync failed", "err", err)
 	}
 }
 
